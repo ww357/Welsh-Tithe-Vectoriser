@@ -30,6 +30,8 @@ ROOT = Path(__file__).resolve().parent
 # Environments are per CONTEXT.md: maptools = geospatial, lines = TensorFlow
 # U-Net (solid + dashed), polygons = PyTorch (MapSAM / text / parcels).
 COMMANDS: dict[str, tuple[str, str | None]] = {
+    # 00 download (Welsh Tithe Vectoriser only — not in the generic upstream)
+    "download":           ("steps/00_download/download.py",               "maptools"),
     # 01 patchify
     "reproject":          ("steps/01_patchify/reproject.py",              "maptools"),
     "draw-mask":          ("steps/01_patchify/draw_mask.py",              "maptools"),
@@ -67,6 +69,7 @@ COMMANDS: dict[str, tuple[str, str | None]] = {
 
 # Printed by `list`, grouped so the pipeline order is obvious.
 GROUPS = [
+    ("00 download",  ["download"]),
     ("01 patchify",  ["reproject", "draw-mask", "patchify"]),
     ("02 annotate",  ["annotate", "export-masks"]),
     ("03 finetune",  ["train-lines", "train-dashed", "dashed-masks",
@@ -99,8 +102,7 @@ def print_list() -> None:
             print(f"    {n:<20} {env or 'any':<9} {script}")
         print()
     print("All flags after the command are passed through to the script.\n"
-          "Example:  python run.py predict-parcels --sheet Selworthy "
-          "--extent boundaries dashed\n")
+          "Example:  python run.py download export-toolkit --county Anglesey\n")
 
 
 def main() -> None:

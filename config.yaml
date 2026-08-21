@@ -208,8 +208,8 @@ parcels:
   # and release the overflow to unassigned background for the operator to mend.
   # Only parcels that exceed the tolerance are touched.
   use_recorded_size: true           # off if the points file has no usable area column
-  size_column: null                 # area column name; null = auto-detect common names
-  size_unit: acres                  # acres | ha | m2 | perches — unit of size_column values
+  size_column: area_hectares        # area column name; null = auto-detect common names
+  size_unit: ha
   size_factor: 1.8                  # allow up to this × recorded area before trimming (fuzzy)
 
   mended_line_width_px: 3           # px width to rasterise mended boundary lines at
