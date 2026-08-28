@@ -994,8 +994,8 @@ def _resolve_targets(conn, specs):
     Names are matched case-insensitively, exact first, then substring."""
     pids = []
     for s in specs:
-        s = s.strip()
-        if not s or s.startswith("#"):
+        s = s.split("#", 1)[0].strip()
+        if not s:
             continue
         if s.isdigit():
             pids.append(int(s))
