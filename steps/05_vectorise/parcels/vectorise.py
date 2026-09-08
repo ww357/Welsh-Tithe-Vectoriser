@@ -1,7 +1,7 @@
 """
 Attribute-join and GeoPackage write for predicted parcel polygons.
 
-Reads parcel_preds.geojson (produced by parcels/predict.py — the point-seeded
+Reads parcel_preds.geojson (produced by parcels/predict.py - the point-seeded
 watershed step), joins all apportionment attribute columns from the original
 parcel_points GeoPackage (joined on rowid), applies a minimum-area filter and
 Douglas-Peucker simplification, then writes the result as a "parcels" layer in
@@ -30,9 +30,11 @@ import pandas as pd
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "steps"))   # shared helpers
+from common import rel_to_root, resolve_output_gpkg   # noqa: E402
 
-# ── PROJ database fix ─────────────────────────────────────────────────────────
-# Mirror of parcel_predict.py — pyproj sometimes cannot locate proj.db in conda
+# -- PROJ database fix ---------------------------------------------------------
+# Mirror of parcel_predict.py - pyproj sometimes cannot locate proj.db in conda
 # environments when pip-installed.  Set PROJ_DATA before any geo imports.
 if "PROJ_DATA" not in os.environ:
     _env_root = Path(sys.executable).parents[1]
@@ -50,7 +52,7 @@ if "PROJ_DATA" not in os.environ:
             os.environ["PROJ_DATA"] = str(_p)
             break
 
-# ── pyogrio sanity-check / eviction ──────────────────────────────────────────
+# -- pyogrio sanity-check / eviction ------------------------------------------
 # Broken pyogrio (stale PROJ, partial uninstall) causes AttributeError on import.
 # Evict it so geopandas falls back to fiona.
 _pyogrio_ok = False
@@ -60,7 +62,7 @@ try:
     _pyogrio_ok = True
 except ValueError as _e:
     if "DATABASE.LAYOUT.VERSION" in str(_e) or "proj_data" in str(_e).lower():
-        print("Warning: pyogrio PROJ conflict — falling back to fiona.")
+        print("Warning: pyogrio PROJ conflict - falling back to fiona.")
 except (ImportError, AttributeError):
     pass
 
@@ -74,23 +76,48 @@ import geopandas as gpd  # noqa: E402
 from shapely.geometry import shape as shapely_shape  # noqa: E402
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 
-def read_geojson_to_gdf(path: Path) -> gpd.GeoDataFrame:
+# Self-contained PROJ4 for OSGB36 / British National Grid - fully numeric, so PROJ
+# needs no database lookup. Used as a fast-path for EPSG:27700 so BNG output is
+# byte-identical and still works even if proj.db is unavailable.
+_BNG_PROJ4 = (
+    "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 "
+    "+x_0=400000 +y_0=-100000 "
+    "+a=6377563.396 +b=6356256.909 "
+    "+towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489 "
+    "+units=m +no_defs"
+)
+
+
+def _geojson_epsg(doc: dict) -> int | None:
+    """Extract the EPSG code from a GeoJSON crs member (written by parcels/predict.py).
+
+    Handles 'urn:ogc:def:crs:EPSG::27700' and 'EPSG:27700' forms. Returns None if
+    there is no crs member (predict.py omits it for a source with no EPSG code).
     """
-    Read a GeoJSON file using the stdlib json module + shapely, bypassing
-    geopandas / fiona / pyproj CRS resolution entirely.
-    Returns a GeoDataFrame with CRS set to EPSG:27700 (all parcel predictions
-    are in BNG — the TIF and GeoPackage are both EPSG:27700).
+    name = (((doc.get("crs") or {}).get("properties") or {}).get("name") or "")
+    digits = name.rsplit(":", 1)[-1] if ":" in name else ""
+    return int(digits) if digits.isdigit() else None
 
-    CRS strategy: build pyproj.CRS from a fully self-contained PROJ4 string
-    (explicit ellipsoid radii + towgs84 shifts) so PROJ never needs to query
-    its database.  Passing the resulting CRS *object* to gdf.crs bypasses the
-    second lookup that geopandas would otherwise make via from_user_input().
+
+def read_geojson_to_gdf(path: Path) -> tuple[gpd.GeoDataFrame, int | None]:
+    """
+    Read a GeoJSON using stdlib json + shapely, bypassing geopandas/fiona/pyproj
+    CRS resolution. Returns (gdf, epsg) where epsg is the source CRS code carried
+    in the GeoJSON crs member (any projected CRS - BNG, UTM, Irish Grid, ...), or
+    None if the source had no EPSG.
+
+    CRS strategy: EPSG:27700 uses the self-contained BNG PROJ4 above (no db lookup,
+    byte-identical to before). Any other EPSG is built with pyproj.CRS.from_epsg,
+    which resolves via proj.db (located by the PROJ_DATA fix at the top of this
+    file). Passing a pyproj.CRS *object* to gdf.crs avoids a second lookup.
     """
     import pyproj
 
     doc = json.loads(path.read_text())
+    epsg = _geojson_epsg(doc)
+
     rows: list[dict] = []
     for feat in doc.get("features", []):
         props = feat.get("properties") or {}
@@ -99,32 +126,26 @@ def read_geojson_to_gdf(path: Path) -> gpd.GeoDataFrame:
 
     gdf = gpd.GeoDataFrame(rows, geometry="geometry")
 
-    # PROJ4 for OSGB36 / British National Grid — fully numeric, no authority-code lookup.
-    # +a/+b replace +ellps=airy; +towgs84 replaces +datum=OSGB36.
-    # PROJ can construct this entirely from built-in projection code, no proj.db needed.
-    BNG_PROJ4 = (
-        "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 "
-        "+x_0=400000 +y_0=-100000 "
-        "+a=6377563.396 +b=6356256.909 "
-        "+towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489 "
-        "+units=m +no_defs"
-    )
-    try:
-        bng_crs = pyproj.CRS.from_proj4(BNG_PROJ4)
-        # Assigning a pyproj.CRS object calls from_user_input(obj) internally,
-        # which just copies it — no EPSG database lookup.
-        gdf.crs = bng_crs
-    except Exception as exc:
-        print(f"  Warning: could not set CRS ({exc}); CRS will be absent from output. "
-              "You can assign it manually in QGIS.")
+    if epsg is None:
+        print("  Note: GeoJSON has no CRS code - output CRS will be unset; "
+              "assign it in QGIS.")
+        return gdf, None
 
-    return gdf
+    try:
+        crs_obj = pyproj.CRS.from_proj4(_BNG_PROJ4) if epsg == 27700 \
+                  else pyproj.CRS.from_epsg(epsg)
+        gdf.crs = crs_obj
+    except Exception as exc:
+        print(f"  Warning: could not set CRS EPSG:{epsg} ({exc}); CRS will be absent "
+              "from output. You can assign it manually in QGIS.")
+
+    return gdf, epsg
 
 
 def read_gpkg_attrs(path: Path) -> pd.DataFrame:
     """
     Read all attribute columns (non-geometry) from the first feature table in
-    a GeoPackage using sqlite3 — no geopandas or pyproj required.
+    a GeoPackage using sqlite3 - no geopandas or pyproj required.
     Returns a plain DataFrame (no geometry column).
     """
     con = sqlite3.connect(str(path))
@@ -151,7 +172,7 @@ def read_gpkg_attrs(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=col_names)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 def _resolve_in_dir(folder: Path, sheet_id: str, default_name: str) -> Path:
     """Prefer a *.gpkg in `folder` whose name contains the sheet; else the default."""
@@ -161,54 +182,6 @@ def _resolve_in_dir(folder: Path, sheet_id: str, default_name: str) -> Path:
         if matches:
             return matches[0]
     return folder / default_name
-
-
-def _rel(p: Path) -> str:
-    """Path relative to ROOT for printing, falling back to absolute for --gpkg
-    targets outside the repo."""
-    try:
-        return str(p.relative_to(ROOT))
-    except ValueError:
-        return str(p)
-
-
-def resolve_output_gpkg(sheet_id: str, cfg: dict, gpkg_arg: str | None,
-                        mended: bool) -> Path:
-    """
-    Pick the GeoPackage to write to.
-
-    Default is paths.outputs; --mended switches to paths.outputs_mended; --gpkg
-    overrides both. The target is deliberately never inferred from what happens
-    to exist on disk: this script drops and rewrites the "parcels" layer, so
-    silently redirecting into a hand-corrected file would destroy mending.
-    (Until 2026-07 this step defaulted to mended-if-exists with --no-mended to
-    opt out; it now matches the other vectorise steps, which are opt-in.)
-    """
-    if gpkg_arg:
-        p = Path(gpkg_arg)
-        return p if p.is_absolute() else ROOT / p
-
-    if not mended:
-        return ROOT / cfg["paths"]["outputs"] / f"{sheet_id}.gpkg"
-
-    mended_dir = ROOT / cfg["paths"].get("outputs_mended", "data/mended outputs")
-    # Mended files are named for the sheet but not always exactly
-    # (e.g. "Porlock mended.gpkg") — same resolution as parcels/predict.py.
-    if mended_dir.exists():
-        exact = mended_dir / f"{sheet_id}.gpkg"
-        if exact.exists():
-            return exact
-        matches = sorted(p for p in mended_dir.glob("*.gpkg")
-                         if sheet_id.lower() in p.stem.lower())
-        if matches:
-            return matches[0]
-
-    sys.exit(
-        f"--mended: no GeoPackage for sheet '{sheet_id}' in {mended_dir}\n"
-        f"Looked for '{sheet_id}.gpkg' and any *.gpkg with '{sheet_id}' in the name.\n"
-        f"Put the mended file there, or drop --mended to write to "
-        f"{cfg['paths']['outputs']}{sheet_id}.gpkg."
-    )
 
 
 def main() -> None:
@@ -232,7 +205,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.output:
-        print("Note: --output is deprecated — use --gpkg instead.")
+        print("Note: --output is deprecated - use --gpkg instead.")
     if args.no_mended:
         print("Note: --no-mended is deprecated and now has no effect: data/outputs is "
               "the default. Pass --mended to write into the mended GeoPackage.")
@@ -268,22 +241,22 @@ def main() -> None:
     gpkg_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Points join : {points_path.name}")
-    print(f"Output GPKG : {_rel(gpkg_path)}"
-          f"{'   (MENDED — parcels layer added, other layers preserved)' if args.mended else ''}")
+    print(f"Output GPKG : {rel_to_root(gpkg_path)}"
+          f"{'   (MENDED - parcels layer added, other layers preserved)' if args.mended else ''}")
 
-    # ── Load predictions (json + shapely — no pyproj CRS lookup) ─────────────
+    # -- Load predictions (json + shapely - no pyproj CRS lookup) -------------
     print(f"Reading {pred_geojson.name} ...")
-    gdf = read_geojson_to_gdf(pred_geojson)
+    gdf, src_epsg = read_geojson_to_gdf(pred_geojson)
     print(f"  {len(gdf):,} raw parcel polygons   CRS: {gdf.crs}")
 
-    # ── Min-area filter ───────────────────────────────────────────────────────
+    # -- Min-area filter -------------------------------------------------------
     if min_area > 0:
         before = len(gdf)
         gdf = gdf[gdf.geometry.area >= min_area].copy()
         removed = before - len(gdf)
-        print(f"  Min-area filter ({min_area} m²): removed {removed}, kept {len(gdf)}")
+        print(f"  Min-area filter ({min_area} m2): removed {removed}, kept {len(gdf)}")
 
-    # ── Simplify (topology-preserving across the whole coverage) ──────────────
+    # -- Simplify (topology-preserving across the whole coverage) --------------
     # A plain per-polygon .simplify() moves each shared edge independently, which
     # re-opens slivers/overlaps between neighbouring parcels.  shapely.coverage_simplify
     # simplifies the shared edge network ONCE, so adjacent parcels stay joined.
@@ -298,14 +271,14 @@ def main() -> None:
             print(f"  coverage_simplify unavailable ({type(exc).__name__}: {exc}); "
                   "leaving edges unsimplified to avoid reintroducing slivers")
 
-    # ── Attribute join (sqlite3 — no pyproj) ──────────────────────────────────
+    # -- Attribute join (sqlite3 - no pyproj) ----------------------------------
     print(f"Reading {points_path.name} for attribute join ...")
     pts_attrs = read_gpkg_attrs(points_path)
 
     # Normalise rowid to nullable Int64 on both sides for a clean join.
     # rowid is per-parish in the source GeoPackage so duplicates exist across
     # the full 6003-row table.  Deduplicate pts_attrs so the left join stays
-    # 1:1 (one prediction row → at most one attribute row).
+    # 1:1 (one prediction row -> at most one attribute row).
     gdf["_join_id"]       = pd.to_numeric(gdf["rowid"],          errors="coerce").astype("Int64")
     pts_attrs["_join_id"] = pd.to_numeric(pts_attrs.get("rowid", pd.Series(dtype=object)),
                                           errors="coerce").astype("Int64")
@@ -317,7 +290,7 @@ def main() -> None:
     n_before_dedup = len(pts_attrs)
     pts_attrs = pts_attrs.drop_duplicates(subset=["_join_id"], keep="first")
     if len(pts_attrs) < n_before_dedup:
-        print(f"  Note: deduplicated pts_attrs from {n_before_dedup} → "
+        print(f"  Note: deduplicated pts_attrs from {n_before_dedup} -> "
               f"{len(pts_attrs)} rows on rowid (non-unique keys in source GeoPackage)")
 
     attr_cols   = [c for c in pts_attrs.columns if c != "_join_id"]
@@ -325,10 +298,10 @@ def main() -> None:
     gdf = gdf.merge(pts_attrs, on="_join_id", how="left", suffixes=("", "_pt"))
     gdf = gdf.drop(columns=["_join_id"])
 
-    # Sanity check — if the merge still exploded despite dedup, abort early
+    # Sanity check - if the merge still exploded despite dedup, abort early
     if len(gdf) > before_join * 2:
         sys.exit(
-            f"ERROR: merge produced {len(gdf):,} rows from {before_join:,} predictions — "
+            f"ERROR: merge produced {len(gdf):,} rows from {before_join:,} predictions - "
             "the rowid join key is still non-unique in pts_attrs. "
             "Check the source GeoPackage for duplicate rowid values."
         )
@@ -337,12 +310,12 @@ def main() -> None:
     print(f"  Joined {len(attr_cols)} attribute columns  "
           f"({matched}/{before_join} rows matched)")
 
-    # ── Fiona compatibility: cast pandas StringDtype → plain object ───────────
+    # -- Fiona compatibility: cast pandas StringDtype -> plain object -----------
     str_cols = gdf.select_dtypes(include="string").columns.tolist()
     if str_cols:
         gdf[str_cols] = gdf[str_cols].astype(object)
 
-    # ── Rename reserved GDAL column names ────────────────────────────────────
+    # -- Rename reserved GDAL column names ------------------------------------
     # GDAL treats a GeoJSON property named "fid" (or "id") as the OGR feature
     # ID and uses it as the GPKG primary key.  If two predictions inherited the
     # same fid from the attribute join (because they shared a non-unique rowid),
@@ -352,18 +325,18 @@ def main() -> None:
     if rename_map:
         gdf = gdf.rename(columns=rename_map)
 
-    # ── Write via temp GeoJSON → ogr2ogr → GPKG ──────────────────────────────
+    # -- Write via temp GeoJSON -> ogr2ogr -> GPKG ------------------------------
     # fiona/geopandas.to_file() fails because GDAL can't build a SpatialReference
     # from our pyproj-based CRS object (same broken proj.db, different callsite).
     # ogr2ogr is a subprocess that runs in the conda env's full GDAL context
-    # (GDAL_DATA / PROJ_DATA env vars set by conda activate), so EPSG:27700
+    # (GDAL_DATA / PROJ_DATA env vars set by conda activate), so the EPSG code
     # resolves correctly there even though the Python-side pyproj is broken.
     import subprocess
     import tempfile
 
     print(f"Writing to {gpkg_path.name} (ogr2ogr) ...")
 
-    # Serialise GeoDataFrame to temp GeoJSON using stdlib json — no fiona/pyproj.
+    # Serialise GeoDataFrame to temp GeoJSON using stdlib json - no fiona/pyproj.
     geom_col  = gdf.geometry.name
     attr_cols = [c for c in gdf.columns if c != geom_col]
 
@@ -393,10 +366,10 @@ def main() -> None:
     tmp.write_text(json.dumps({"type": "FeatureCollection", "features": features_out},
                                separators=(",", ":")))
 
-    # ── Scrub any existing 'parcels' layer cleanly before ogr2ogr ────────────
+    # -- Scrub any existing 'parcels' layer cleanly before ogr2ogr ------------
     # We must remove ALL artefacts of a previous parcels layer or ogr2ogr will
     # hit broken state.  The critical ones that were previously missed are the
-    # R-tree spatial index tables (rtree_parcels_geom*) — if these are left
+    # R-tree spatial index tables (rtree_parcels_geom*) - if these are left
     # orphaned, ogr2ogr silently reuses them and QGIS ends up with a corrupt
     # index: features disappear at zoom levels and can't be selected.
     if gpkg_path.exists():
@@ -432,7 +405,7 @@ def main() -> None:
         finally:
             _con.close()
 
-    # Build ogr2ogr command — uses GDAL's own EPSG database, not pyproj.
+    # Build ogr2ogr command - uses GDAL's own EPSG database, not pyproj.
     # -update adds the new layer to the existing GPKG (preserving other layers).
     # -overwrite is NOT used here because we already deleted the layer above;
     # using it on a cleanly-removed layer causes the fid UNIQUE constraint error.
@@ -442,10 +415,13 @@ def main() -> None:
         str(gpkg_path),
         str(tmp),
         "-nln", "parcels",
-        "-a_srs", "EPSG:27700",
         "-nlt", "POLYGON",
         "-update",              # append to existing GPKG (keeps other layers)
     ]
+    # Assign the source CRS (any projected CRS) via GDAL's own EPSG database.
+    # Omit -a_srs when the source had no EPSG so we don't stamp a wrong CRS.
+    if src_epsg is not None:
+        cmd += ["-a_srs", f"EPSG:{src_epsg}"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -457,10 +433,10 @@ def main() -> None:
     finally:
         tmp.unlink(missing_ok=True)
 
-    print(f"\nDone — {len(features_out):,} parcels in 'parcels' layer of {gpkg_path.name}")
+    print(f"\nDone - {len(features_out):,} parcels in 'parcels' layer of {gpkg_path.name}")
     print(
         f"\nNext step: review the 'parcels' layer in QGIS.\n"
-        f"  Parcels are not a learned model — to change the result, re-run\n"
+        f"  Parcels are not a learned model - to change the result, re-run\n"
         f"  steps/04_predict/parcels/predict.py with different --extent /\n"
         f"  --exclude features or parcels: tuning in config.yaml, then re-run this step."
     )
