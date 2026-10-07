@@ -65,6 +65,7 @@ import os
 import re
 import csv
 import glob
+import hashlib
 import json
 import math
 import time
@@ -1816,8 +1817,75 @@ def _write_points_gpkg(path: Path, layer: str, records, columns):
     db.close()
 
 
+def _export_rows(conn, args):
+    """Maps selected for export, after the quality / RMS / parcel-count filters."""
+    targets = []
+    if args.pid:
+        targets.append(str(args.pid))
+    if args.pids:
+        targets += args.pids.split(",")
+    if args.from_file:
+        tf = Path(args.from_file)
+        if not tf.exists():
+            logging.error(f"Target file not found: {tf}")
+            return []
+        targets += tf.read_text(encoding="utf-8").splitlines()
+
+    explicit = bool(targets)
+    if explicit:
+        rows = [conn.execute("SELECT * FROM maps WHERE map_pid=?", (pid,)).fetchone()
+                for pid in _resolve_targets(conn, targets)]
+        rows = [r for r in rows if r]
+    else:
+        rows = _select_rows(conn, args, need_image=True)
+
+    kept = []
+    for r in rows:
+        why = None
+        if not (r["image_path"] and r["parcels_path"]):
+            why = "not downloaded / no parcels file"
+        elif not explicit and r["quality"] == "excluded":
+            why = "quality=excluded"
+        elif args.quality and r["quality"] != args.quality:
+            why = f"quality is {r['quality'] or 'unassessed'}, not {args.quality}"
+        elif args.min_parcels and (r["parcel_count"] or 0) < args.min_parcels:
+            why = f"{r['parcel_count']} parcels < --min-parcels {args.min_parcels}"
+        elif args.max_rms is not None and (r["georef_rms_m"] is None
+                                           or r["georef_rms_m"] > args.max_rms):
+            why = (f"georef RMS {r['georef_rms_m']} m exceeds --max-rms {args.max_rms}"
+                   if r["georef_rms_m"] is not None else "no georef RMS recorded")
+        if why:
+            logging.info(f"  skip {r['parish']} (pid={r['map_pid']}): {why}")
+        else:
+            kept.append(r)
+    return kept
+
+
+def _fingerprint(gcps_bng):
+    """Hash of everything the exported raster + points depend on. If it changes
+    (parcels re-fetched, different resolution...) an old export is stale."""
+    h = hashlib.sha1(f"{TOOLKIT_EPSG}|{TOOLKIT_RES}".encode())
+    for px, py, e, n in gcps_bng:
+        h.update(f"{px:.1f},{py:.1f},{e:.2f},{n:.2f};".encode())
+    return h.hexdigest()
+
+
+def _read_sheet_meta(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def cmd_export_toolkit(args):
-    """Export sheets as toolkit-ready GeoTIFF + parcel points (EPSG:27700)."""
+    """Export sheets as toolkit-ready GeoTIFF + parcel points (EPSG:27700).
+
+    Sheet ID defaults to '{Parish}_{pid}' (unique, same as the downloads folder).
+    Each sheet gets data/raw/<sheet>/<sheet>.json recording which map it came
+    from; an export is never overwritten by a different map, and an up-to-date
+    one is skipped."""
+    import numpy as np
+
     gdalwarp = _find_gdal_tool("gdalwarp")
     gdaltransform = _find_gdal_tool("gdaltransform")
     if not gdalwarp or not gdaltransform:
@@ -1832,126 +1900,184 @@ def cmd_export_toolkit(args):
     pts_dir = toolkit / "data" / "parcel_points"
 
     conn = get_conn()
-    rows = _select_rows(conn, args, need_image=True)
-    rows = [r for r in rows if r["image_path"] and r["parcels_path"]]
+    rows = _export_rows(conn, args)
     if not rows:
         logging.info("No downloaded, georeferenced maps match the filter.")
         conn.close()
         return
+    if args.sheet_name and len(rows) > 1:
+        logging.error("--sheet-name can only be used with a single map "
+                      f"({len(rows)} selected).")
+        conn.close()
+        return
 
     logging.info(f"Exporting {len(rows)} sheet(s) to {toolkit}")
+    done = up_to_date = failed = 0
     for row in rows:
         parish = row["parish"] or f"pid_{row['map_pid']}"
-        sheet = args.sheet_name or safe_name(parish)
+        sheet = args.sheet_name or map_paths(row)[1]
         img = Path(row["image_path"])
         gj = Path(row["parcels_path"])
         if not img.exists() or not gj.exists():
             logging.warning(f"  {sheet}: image or parcels file missing -- skipping.")
+            failed += 1
             continue
 
         logging.info(f"\n[{sheet}] {row['county']} / {parish} (pid={row['map_pid']})")
         out_tif = raw_dir / sheet / f"{sheet}.tif"
+        part_tif = raw_dir / sheet / f"{sheet}.part.tif"
         out_pts = pts_dir / f"{sheet}_points.gpkg"
-        if out_tif.exists() and not args.overwrite:
-            logging.info(f"  {out_tif.relative_to(toolkit)} exists "
-                         "-- use --overwrite to replace. Skipping raster.")
-        out_tif.parent.mkdir(parents=True, exist_ok=True)
-        pts_dir.mkdir(parents=True, exist_ok=True)
+        out_meta = raw_dir / sheet / f"{sheet}.json"
+        meta = _read_sheet_meta(out_meta)
+
+        # Never let one map overwrite another's sheet.
+        if meta and meta.get("map_pid") != row["map_pid"]:
+            logging.error(f"  Sheet '{sheet}' already holds map pid={meta.get('map_pid')}, "
+                          f"not {row['map_pid']} -- refusing. Use a different --sheet-name.")
+            failed += 1
+            continue
+        if meta is None and out_tif.exists() and not args.overwrite:
+            logging.error(f"  {out_tif.relative_to(toolkit)} exists but has no "
+                          f"{out_meta.name} (made by an older version, or interrupted), "
+                          "so its origin can't be verified -- re-run with --overwrite.")
+            failed += 1
+            continue
 
         fc = json.loads(gj.read_text(encoding="utf-8"))
         features = fc.get("features", [])
         scale = (fc.get("metadata", {}) or {}).get("scale_factor", 1) or 1
 
-        # ── GCPs: pixel -> BNG (reproject the lon/lat GCPs once) ─────────────
+        # -- GCPs: pixel -> BNG (reproject the lon/lat GCPs once) -------------
         gcps_bng = gcps_bng_from_features(features, scale=scale)
         if len(gcps_bng) < MIN_GCPS:
             logging.warning(f"  Only {len(gcps_bng)} GCPs -- skipping.")
+            failed += 1
             continue
         gcps_bng = _sigma_clip(gcps_bng)
+        e2, n2, d2 = _fit_polynomial(gcps_bng, order=2)
+        rms = float(np.sqrt(np.mean(np.array(_residuals_m(gcps_bng, e2, n2, d2)) ** 2)))
+        fingerprint = _fingerprint(gcps_bng)
+
+        raster_ok = (out_tif.exists() and meta is not None and not args.overwrite)
+        if raster_ok and meta.get("fingerprint") != fingerprint:
+            logging.error("  The parcels/georeferencing changed since this sheet was "
+                          "exported -- raster and points would no longer match. "
+                          "Re-run with --overwrite.")
+            failed += 1
+            continue
+        points_ok = raster_ok and out_pts.exists() and meta.get("complete")
+        if points_ok:
+            logging.info("  Already exported and up to date -- skipping.")
+            up_to_date += 1
+            continue
+
+        out_tif.parent.mkdir(parents=True, exist_ok=True)
+        pts_dir.mkdir(parents=True, exist_ok=True)
 
         # GCP VRT in BNG -- used for BOTH the warp and the point placement, so
         # the two are guaranteed to agree.
         vrt_bng = img.parent / f"{img.stem}.bng.gcps.vrt"
-        _write_vrt(vrt_bng, img, gcps=gcps_bng, projection=_BNG_WKT)
+        try:
+            _write_vrt(vrt_bng, img, gcps=gcps_bng, projection=_BNG_WKT)
 
-        # ── Raster ───────────────────────────────────────────────────────────
-        if not out_tif.exists() or args.overwrite:
-            cmd = [str(gdalwarp), "-overwrite", "-order", "2",
-                   "-t_srs", f"EPSG:{TOOLKIT_EPSG}",
-                   "-tr", str(TOOLKIT_RES), str(TOOLKIT_RES),
-                   "-r", "bilinear", "-co", "COMPRESS=DEFLATE",
-                   "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
-                   str(vrt_bng), str(out_tif)]
-            logging.info(f"  Warping to EPSG:{TOOLKIT_EPSG} @ {TOOLKIT_RES} m/px "
-                         "(several minutes)...")
-            res = subprocess.run(cmd, capture_output=True, text=True,
-                                 env=_gdal_env(gdalwarp))
-            if res.returncode != 0:
-                logging.error(f"  gdalwarp failed: {res.stderr.strip()[-400:]}")
-                continue
-            logging.info(f"  Saved: {out_tif.relative_to(toolkit)}")
-            build_overviews(out_tif)
-
-        # ── Points: pixel -> BNG through the SAME GCP transform ──────────────
-        pixel_pts, props_list = [], []
-        for f in features:
-            p = f.get("properties", {})
-            px, py = p.get("pixel_x"), p.get("pixel_y")
-            if px is None or py is None:
-                continue
-            pixel_pts.append((px, py))
-            props_list.append(p)
-
-        if not pixel_pts:
-            logging.warning("  No pixel coordinates in parcels file -- "
-                            "points not written.")
-            vrt_bng.unlink(missing_ok=True)
-            continue
-
-        world = _gdal_batch_transform(gdaltransform, ["-order", "2", str(vrt_bng)],
-                                      pixel_pts)
-
-        columns = ([("rowid", "INTEGER")]
-                   + [(n, "TEXT" if s in (None, "field_number", "farm_name",
-                                          "field_name", "land_use_facet",
-                                          "occupier_facet", "landowner_facet")
-                       else "REAL") for n, s in _TOOLKIT_COLUMNS]
-                   + [("Easting", "REAL"), ("Northing", "REAL"),
-                      ("area_hectares", "REAL"), ("rent_decimal_pounds", "REAL"),
-                      ("pixel_x", "INTEGER"), ("pixel_y", "INTEGER"),
-                      ("map_pid", "INTEGER"), ("nlw_id", "TEXT")])
-
-        records = []
-        for i, ((east, north), p) in enumerate(zip(world, props_list), start=1):
-            vals = [i]
-            for name, src in _TOOLKIT_COLUMNS:
-                if src is None:
-                    vals.append(parish)
+            # -- Raster (warped to a temp name, renamed only on success) -----
+            if not raster_ok:
+                part_tif.unlink(missing_ok=True)
+                cmd = [str(gdalwarp), "-overwrite", "-order", "2",
+                       "-t_srs", f"EPSG:{TOOLKIT_EPSG}",
+                       "-tr", str(TOOLKIT_RES), str(TOOLKIT_RES),
+                       "-r", "bilinear", "-co", "COMPRESS=DEFLATE",
+                       "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
+                       str(vrt_bng), str(part_tif)]
+                logging.info(f"  Warping to EPSG:{TOOLKIT_EPSG} @ {TOOLKIT_RES} m/px "
+                             "(several minutes)...")
+                res = subprocess.run(cmd, capture_output=True, text=True,
+                                     env=_gdal_env(gdalwarp))
+                if res.returncode != 0:
+                    logging.error(f"  gdalwarp failed: {res.stderr.strip()[-400:]}")
+                    part_tif.unlink(missing_ok=True)
+                    failed += 1
                     continue
-                v = p.get(src)
-                if isinstance(v, list):
-                    v = "; ".join(str(x) for x in v)
-                if name in ("ParcelID",) and v is not None:
-                    v = str(v)
-                vals.append(v)
-            vals += [east, north,
-                     _area_hectares(p.get("acres"), p.get("roods"), p.get("perches")),
-                     _rent_decimal_pounds(p.get("pounds"), p.get("shillings"),
-                                          p.get("pence")),
-                     p.get("pixel_x"), p.get("pixel_y"), row["map_pid"],
-                     p.get("id")]
-            records.append((east, north, vals))
+                os.replace(part_tif, out_tif)
+                logging.info(f"  Saved: {out_tif.relative_to(toolkit)}")
+                build_overviews(out_tif)
+                meta = {"map_pid": row["map_pid"], "county": row["county"],
+                        "parish": row["parish"], "sheet": sheet,
+                        "source_image": img.name, "scale_factor": scale,
+                        "crs": f"EPSG:{TOOLKIT_EPSG}", "resolution_m": TOOLKIT_RES,
+                        "gcps_used": len(gcps_bng), "georef_rms_m": round(rms, 1),
+                        "fingerprint": fingerprint, "complete": False,
+                        "exported": datetime.now().isoformat(timespec="seconds")}
+                out_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            else:
+                logging.info("  Raster already exported and current -- reusing.")
 
-        _write_points_gpkg(out_pts, f"{sheet} Apportionment Points", records, columns)
-        logging.info(f"  Saved: {out_pts.relative_to(toolkit)}  "
-                     f"({len(records)} seed points, EPSG:{TOOLKIT_EPSG})")
-        vrt_bng.unlink(missing_ok=True)
+            # -- Points: pixel -> BNG through the SAME GCP transform ----------
+            pixel_pts, props_list = [], []
+            for f in features:
+                pr = f.get("properties", {})
+                px, py = pr.get("pixel_x"), pr.get("pixel_y")
+                if px is None or py is None:
+                    continue
+                pixel_pts.append((px, py))
+                props_list.append(pr)
+
+            if not pixel_pts:
+                logging.warning("  No pixel coordinates in parcels file -- "
+                                "points not written.")
+                failed += 1
+                continue
+
+            world = _gdal_batch_transform(gdaltransform,
+                                          ["-order", "2", str(vrt_bng)], pixel_pts)
+
+            columns = ([("rowid", "INTEGER")]
+                       + [(n, "TEXT" if sc in (None, "field_number", "farm_name",
+                                               "field_name", "land_use_facet",
+                                               "occupier_facet", "landowner_facet")
+                           else "REAL") for n, sc in _TOOLKIT_COLUMNS]
+                       + [("Easting", "REAL"), ("Northing", "REAL"),
+                          ("area_hectares", "REAL"), ("rent_decimal_pounds", "REAL"),
+                          ("pixel_x", "INTEGER"), ("pixel_y", "INTEGER"),
+                          ("map_pid", "INTEGER"), ("nlw_id", "TEXT")])
+
+            records = []
+            for i, ((east, north), pr) in enumerate(zip(world, props_list), start=1):
+                vals = [i]
+                for name, src in _TOOLKIT_COLUMNS:
+                    if src is None:
+                        vals.append(parish)
+                        continue
+                    v = pr.get(src)
+                    if isinstance(v, list):
+                        v = "; ".join(str(x) for x in v)
+                    if name in ("ParcelID",) and v is not None:
+                        v = str(v)
+                    vals.append(v)
+                vals += [east, north,
+                         _area_hectares(pr.get("acres"), pr.get("roods"), pr.get("perches")),
+                         _rent_decimal_pounds(pr.get("pounds"), pr.get("shillings"),
+                                              pr.get("pence")),
+                         pr.get("pixel_x"), pr.get("pixel_y"), row["map_pid"],
+                         pr.get("id")]
+                records.append((east, north, vals))
+
+            _write_points_gpkg(out_pts, f"{sheet} Apportionment Points", records, columns)
+            logging.info(f"  Saved: {out_pts.relative_to(toolkit)}  "
+                         f"({len(records)} seed points, EPSG:{TOOLKIT_EPSG})")
+            meta["complete"] = True
+            meta["seed_points"] = len(records)
+            out_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            done += 1
+        finally:
+            vrt_bng.unlink(missing_ok=True)
 
         logging.info(f"  >> Toolkit ready. Run:  python steps/01_patchify/"
                      f"patchify.py --sheet {sheet} --mask")
 
     conn.close()
-    logging.info("\nExport complete.")
+    logging.info(f"\nExport complete: {done} exported, {up_to_date} already up to date, "
+                 f"{failed} skipped/failed.")
 
 
 def _stash_layer_styles(path: Path):
@@ -2241,11 +2367,20 @@ def main():
     p.add_argument("--toolkit-dir", required=True,
                    help="Path to the toolkit repo (the folder with config.yaml)")
     p.add_argument("--pid", type=int)
+    p.add_argument("--pids", help='Comma-separated PIDs or parish names')
+    p.add_argument("--from-file", help="Text file of targets, one PID or parish name per line")
     p.add_argument("--county")
+    p.add_argument("--quality", choices=["high", "low"],
+                   help="Only export maps with this quality flag")
+    p.add_argument("--max-rms", type=float,
+                   help="Skip maps whose georeferencing RMS (metres) is above this")
+    p.add_argument("--min-parcels", type=int, default=0,
+                   help="Skip maps with fewer apportionment parcels than this")
     p.add_argument("--sheet-name",
-                   help="Override the sheet ID (default: parish name)")
+                   help="Override the sheet ID (default: {Parish}_{pid}); "
+                        "single map only")
     p.add_argument("--overwrite", action="store_true",
-                   help="Re-warp even if the GeoTIFF already exists")
+                   help="Re-export even if the sheet already exists / is up to date")
 
     p = sub.add_parser(
         "tidy", help="Remove legacy sidecar files so every map folder is uniform "
