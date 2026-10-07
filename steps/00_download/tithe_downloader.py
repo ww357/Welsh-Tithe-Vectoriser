@@ -9,13 +9,26 @@ parcel point files from the National Library of Wales (places.library.wales).
 For every map this produces one folder containing:
 
   {Parish}_{pid}.jpg               full-resolution stitched map scan
-  {Parish}_{pid}.parcels.geojson   all apportionment parcels as points:
-                                     - WGS84 geometry (GIS / QGIS overlay)
+  {Parish}_{pid}.parcels.geojson   all apportionment parcels as points
+                                     (raw WGS84 cache straight from the API;
+                                     everything else is derived from it in BNG):
+                                     - WGS84 geometry (source data / cache)
                                      - pixel_x / pixel_y (SAM point prompts)
                                      - all attributes (field no., land use,
                                        occupier, landowner, acreage, rent...)
-  {Parish}_{pid}.vrt               GDAL VRT with embedded GCPs -- open in QGIS
-  {Parish}_{pid}.jgw / .prj        affine world file fallback
+  {Parish}_{pid}.vrt               GDAL VRT, affine georeference in EPSG:27700 (BNG)
+                                   -- open THIS in QGIS
+  {Parish}_{pid}.vrt.ovr           raster pyramids for the .vrt, so huge scans
+                                   pan/zoom smoothly in QGIS
+  {Parish}_{pid}_bng.tif           only with --warp: north-up BNG GeoTIFF
+
+That is the complete, uniform set -- nothing else is left in a map folder.
+(`tidy` removes sidecars written by older versions.)
+
+All georeferencing output is British National Grid (EPSG:27700, metres): the
+parcel lon/lat from the NLW API are reprojected to BNG once (via GDAL's
+gdaltransform) and every fit, residual, VRT, world file, warp and GeoPackage
+works in metres from there.
 
 Apportionment page images are NOT downloaded (the parcel points replace them).
 
@@ -43,6 +56,9 @@ Other commands / flags
   parcels --pid 4634773             (re)build just the parcel GeoJSON
   georeference --pid 4634773        (re)build GeoJSON + VRT + world file
   georeference --refetch            ignore cached GeoJSON, re-pull from API
+  tidy [--apply] [--include-warped] list (or delete) legacy sidecar clutter
+  merge --from <tithe_maps dir>     bring maps downloaded elsewhere into this
+                                    database (dry run unless --apply)
 """
 
 import os
@@ -89,6 +105,8 @@ TILE_DELAY    = 0.25  # seconds between tile downloads
 MAX_RETRIES   = 4
 
 MIN_GCPS      = 6     # minimum parcels needed for a polynomial fit
+
+BNG_EPSG      = 27700   # British National Grid -- CRS of every georef output
 
 # The 13 historical counties of Wales as used in NLW feature IDs
 WELSH_COUNTIES = [
@@ -261,12 +279,13 @@ def _norm_sql(col):
     return expr
 
 
-def map_paths(row):
-    """Return (folder, stem) for a map record's output files."""
+def map_paths(row, root=None):
+    """Return (folder, stem) for a map record's output files.
+    root: a downloads directory other than this machine's (used by `merge`)."""
     county = safe_name(row["county"] or "Unknown_County")
     parish = safe_name(row["parish"] or "Unknown_Parish")
     stem   = f"{parish}_{row['map_pid']}"
-    return DOWNLOADS_DIR / county / stem, stem
+    return (root or DOWNLOADS_DIR) / county / stem, stem
 
 
 def parcel_pixel_centre(props):
@@ -727,8 +746,29 @@ def gcps_from_features(features, scale=1):
     return gcps
 
 
+def lonlat_to_bng(coords, tool=None):
+    """[(lon, lat), ...] -> [(easting, northing), ...] in EPSG:27700."""
+    tool = tool or _find_gdal_tool("gdaltransform")
+    if not tool:
+        raise RuntimeError("gdaltransform not found (install QGIS/OSGeo4W) -- "
+                           "needed to reproject WGS84 -> BNG.")
+    return _gdal_batch_transform(
+        tool, ["-s_srs", "EPSG:4326", "-t_srs", f"EPSG:{BNG_EPSG}"], coords)
+
+
+def gcps_bng_from_features(features, scale=1):
+    """(pixel_x, pixel_y, easting, northing) -- the lon/lat GCPs reprojected to
+    BNG in one gdaltransform call. Raises RuntimeError if GDAL is unavailable."""
+    gcps = gcps_from_features(features, scale=scale)
+    if not gcps:
+        return []
+    en = lonlat_to_bng([(g[2], g[3]) for g in gcps])
+    return [(g[0], g[1], e, n) for g, (e, n) in zip(gcps, en)]
+
+
 def _fit_polynomial(gcps, order):
-    """Least-squares pixel->WGS84 fit. order 1 = affine, 2 = quadratic."""
+    """Least-squares pixel->BNG fit. order 1 = affine, 2 = quadratic.
+    Returns (easting_coeffs, northing_coeffs, design)."""
     import numpy as np
 
     def design(px, py):
@@ -737,27 +777,25 @@ def _fit_polynomial(gcps, order):
         return [1.0, px, py, px * px, px * py, py * py]
 
     A = np.array([design(px, py) for px, py, _, _ in gcps])
-    lng_c, *_ = np.linalg.lstsq(A, np.array([g[2] for g in gcps]), rcond=None)
-    lat_c, *_ = np.linalg.lstsq(A, np.array([g[3] for g in gcps]), rcond=None)
-    return lng_c, lat_c, design
+    e_c, *_ = np.linalg.lstsq(A, np.array([g[2] for g in gcps]), rcond=None)
+    n_c, *_ = np.linalg.lstsq(A, np.array([g[3] for g in gcps]), rcond=None)
+    return e_c, n_c, design
 
 
-def _residuals_m(gcps, lng_c, lat_c, design):
+def _residuals_m(gcps, e_c, n_c, design):
+    """Fit residual of each GCP in metres (GCPs are already in BNG)."""
     import numpy as np
-    M_PER_DEG = 111_320.0
     out = []
-    for px, py, lng, lat in gcps:
+    for px, py, east, north in gcps:
         row = np.array(design(px, py))
-        dlng = (float(row @ lng_c) - lng) * M_PER_DEG * math.cos(math.radians(lat))
-        dlat = (float(row @ lat_c) - lat) * M_PER_DEG
-        out.append(math.hypot(dlng, dlat))
+        out.append(math.hypot(float(row @ e_c) - east, float(row @ n_c) - north))
     return out
 
 
 def _sigma_clip(gcps, sigma=3.0):
     import numpy as np
-    lng_c, lat_c, design = _fit_polynomial(gcps, order=1)
-    res = np.array(_residuals_m(gcps, lng_c, lat_c, design))
+    e_c, n_c, design = _fit_polynomial(gcps, order=1)
+    res = np.array(_residuals_m(gcps, e_c, n_c, design))
     thresh = res.mean() + sigma * res.std()
     kept = [g for g, r in zip(gcps, res) if r <= thresh]
     if len(kept) < len(gcps):
@@ -766,28 +804,17 @@ def _sigma_clip(gcps, sigma=3.0):
     return kept
 
 
-_WGS84_PRJ = (
-    'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",'
-    'SPHEROID["WGS_1984",6378137.0,298.257223563]],'
-    'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]'
+_BNG_WKT = (
+    'PROJCS["OSGB 1936 / British National Grid",'
+    'GEOGCS["OSGB 1936",DATUM["OSGB_1936",'
+    'SPHEROID["Airy 1830",6377563.396,299.3249646,AUTHORITY["EPSG","7001"]],'
+    'AUTHORITY["EPSG","6277"]],PRIMEM["Greenwich",0],'
+    'UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4277"]],'
+    'PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",49],'
+    'PARAMETER["central_meridian",-2],PARAMETER["scale_factor",0.9996012717],'
+    'PARAMETER["false_easting",400000],PARAMETER["false_northing",-100000],'
+    'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AUTHORITY["EPSG","27700"]]'
 )
-_WGS84_WKT = (
-    'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'
-    'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433,'
-    'AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]]'
-)
-_WLD_EXT = {".jpg": ".jgw", ".jpeg": ".jgw", ".tif": ".tfw",
-            ".tiff": ".tfw", ".png": ".pgw"}
-
-
-def _write_world_file(path, lng_c, lat_c, design):
-    import numpy as np
-    A, D = float(lng_c[1]), float(lat_c[1])
-    B, E = float(lng_c[2]), float(lat_c[2])
-    row = np.array(design(0.5, 0.5))
-    C, F = float(row @ lng_c), float(row @ lat_c)
-    path.write_text(f"{A:.10f}\n{D:.10f}\n{B:.10f}\n{E:.10f}\n{C:.10f}\n{F:.10f}\n")
-
 
 def _write_vrt(vrt_path, img_path, gcps=None, geotransform=None, projection=None):
     """GDAL VRT wrapper for the map image.
@@ -795,9 +822,9 @@ def _write_vrt(vrt_path, img_path, gcps=None, geotransform=None, projection=None
     geotransform -> affine VRT: QGIS displays it georeferenced immediately.
     gcps         -> GCP VRT: pixel-space in QGIS, but gdalwarp -tps turns it
                     into a precisely warped GeoTIFF.
-    projection   -> WKT for the GCPs (defaults to WGS84).
+    projection   -> WKT for the GCPs / geotransform (defaults to BNG, EPSG:27700).
     """
-    wkt = projection or _WGS84_WKT
+    wkt = projection or _BNG_WKT
     with Image.open(img_path) as im:
         w, h, mode = im.width, im.height, im.mode
         bands = len(im.getbands())
@@ -815,9 +842,9 @@ def _write_vrt(vrt_path, img_path, gcps=None, geotransform=None, projection=None
     if gcps:
         proj = wkt.replace('"', "&quot;")
         lines.append(f'  <GCPList Projection="{proj}">')
-        for i, (px, py, lng, lat) in enumerate(gcps, 1):
+        for i, (px, py, east, north) in enumerate(gcps, 1):
             lines.append(f'    <GCP Id="{i}" Pixel="{px:.1f}" Line="{py:.1f}" '
-                         f'X="{lng:.8f}" Y="{lat:.8f}"/>')
+                         f'X="{east:.3f}" Y="{north:.3f}"/>')
         lines.append("  </GCPList>")
     for b in range(1, bands + 1):
         lines += [
@@ -860,26 +887,61 @@ def _gdal_env(tool: Path):
     return env
 
 
-def build_overviews(tif_path: Path):
-    """Add raster pyramids so QGIS can display huge images without choking."""
+def _raster_size(path: Path):
+    """(width, height) from a VRT header or an image file, without reading pixels."""
+    if path.suffix.lower() == ".vrt":
+        head = path.read_text(encoding="utf-8")[:300]
+        m = re.search(r'rasterXSize="(\d+)" rasterYSize="(\d+)"', head)
+        return int(m.group(1)), int(m.group(2))
+    with Image.open(path) as im:
+        return im.size
+
+
+def _overview_levels(w, h, smallest=256):
+    """Power-of-two decimation levels until the short side would drop below `smallest`."""
+    levels, f = [], 2
+    while min(w, h) // f >= smallest:
+        levels.append(str(f))
+        f *= 2
+    return levels or ["2"]
+
+
+def build_overviews(path: Path, external=False):
+    """Add raster pyramids so QGIS can display huge images without choking.
+    external=True (used for .vrt files) writes them to a '<file>.ovr' sidecar,
+    which GDAL/QGIS pick up automatically; otherwise they are stored inside
+    the GeoTIFF."""
     gdaladdo = _find_gdal_tool("gdaladdo")
     if not gdaladdo:
         logging.warning("  gdaladdo not found -- skipping overviews "
                         "(build pyramids in QGIS layer properties instead).")
         return False
+    w, h = _raster_size(path)
     logging.info("  Building overviews (pyramids)...")
-    result = subprocess.run(
-        [str(gdaladdo), "-r", "average", str(tif_path), "2", "4", "8", "16", "32", "64"],
-        env=_gdal_env(gdaladdo), capture_output=True, text=True)
-    if result.returncode != 0:
-        logging.error(f"  gdaladdo failed: {result.stderr.strip()[-400:]}")
-        return False
-    logging.info("  Overviews built -- QGIS will render this smoothly.")
-    return True
+    cmd = ([str(gdaladdo)] + (["-ro"] if external else [])
+           + ["-r", "average",
+              "--config", "COMPRESS_OVERVIEW", "DEFLATE",
+              "--config", "GDAL_CACHEMAX", "2048",
+              str(path)] + _overview_levels(w, h))
+    ovr = Path(str(path) + ".ovr")
+    ok = False
+    try:
+        result = subprocess.run(cmd, env=_gdal_env(gdaladdo), capture_output=True, text=True)
+        ok = result.returncode == 0
+        if not ok:
+            logging.error(f"  gdaladdo failed: {result.stderr.strip()[-400:]}")
+    finally:
+        # An interrupted/failed build leaves a truncated .ovr that later runs
+        # would mistake for a finished one -- remove it.
+        if external and not ok:
+            ovr.unlink(missing_ok=True)
+    if ok:
+        logging.info("  Overviews built -- QGIS will render this smoothly.")
+    return ok
 
 
 def warp_geotiff(gcps_vrt: Path, out_tif: Path):
-    """North-up 2nd-order polynomial warp via the QGIS-bundled gdalwarp,
+    """North-up 2nd-order polynomial warp to BNG via the QGIS-bundled gdalwarp,
     plus overview pyramids. Returns True on success."""
     gdalwarp = _find_gdal_tool("gdalwarp")
     if not gdalwarp:
@@ -887,7 +949,7 @@ def warp_geotiff(gcps_vrt: Path, out_tif: Path):
         return False
 
     cmd = [str(gdalwarp), "-overwrite", "-order", "2",
-           "-t_srs", "EPSG:4326", "-r", "bilinear",
+           "-t_srs", f"EPSG:{BNG_EPSG}", "-r", "bilinear",
            "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES",
            "-co", "BIGTIFF=IF_SAFER",
            str(gcps_vrt), str(out_tif)]
@@ -896,13 +958,13 @@ def warp_geotiff(gcps_vrt: Path, out_tif: Path):
     if result.returncode != 0:
         logging.error(f"  gdalwarp failed: {result.stderr.strip()[-400:]}")
         return False
-    logging.info(f"  Saved: {out_tif.name} (north-up georeferenced GeoTIFF)")
+    logging.info(f"  Saved: {out_tif.name} (north-up GeoTIFF, EPSG:27700)")
     build_overviews(out_tif)
     return True
 
 
 def process_parcels_and_georef(conn, row, refetch=False, georef=True, warp=False):
-    """Write the parcels GeoJSON and (optionally) VRT + world file for one map.
+    """Write the parcels GeoJSON and (optionally) VRT + pyramids for one map.
     Returns (success, api_was_hit) so callers can skip the rate-limit delay
     for fully cached maps."""
     import numpy as np
@@ -940,7 +1002,11 @@ def process_parcels_and_georef(conn, row, refetch=False, georef=True, warp=False
         logging.warning("  Image not on disk -- parcels written, georeferencing skipped.")
         return True, fetched
 
-    gcps = gcps_from_features(features, scale=scale)
+    try:
+        gcps = gcps_bng_from_features(features, scale=scale)
+    except RuntimeError as exc:
+        logging.error(f"  {exc} Georeferencing skipped.")
+        return True, fetched
     if len(gcps) < MIN_GCPS:
         logging.warning(f"  Only {len(gcps)} usable GCPs (need {MIN_GCPS}) -- "
                         "georeferencing skipped.")
@@ -950,36 +1016,41 @@ def process_parcels_and_georef(conn, row, refetch=False, georef=True, warp=False
         logging.warning("  Too few GCPs after outlier removal -- georeferencing skipped.")
         return True, fetched
 
-    lng1, lat1, d1 = _fit_polynomial(gcps, order=1)
-    rms1 = float(np.sqrt(np.mean(np.array(_residuals_m(gcps, lng1, lat1, d1)) ** 2)))
-    lng2, lat2, d2 = _fit_polynomial(gcps, order=2)
-    rms2 = float(np.sqrt(np.mean(np.array(_residuals_m(gcps, lng2, lat2, d2)) ** 2)))
+    e1, n1, d1 = _fit_polynomial(gcps, order=1)
+    rms1 = float(np.sqrt(np.mean(np.array(_residuals_m(gcps, e1, n1, d1)) ** 2)))
+    e2, n2, d2 = _fit_polynomial(gcps, order=2)
+    rms2 = float(np.sqrt(np.mean(np.array(_residuals_m(gcps, e2, n2, d2)) ** 2)))
     logging.info(f"  {len(gcps)} GCPs | affine RMS {rms1:.0f} m | quadratic RMS {rms2:.0f} m")
 
-    # GDAL geotransform from the affine fit: world = c0 + c1*px + c2*py,
-    # with pixel (0,0) at the top-left image corner.
-    geotransform = (float(lng1[0]), float(lng1[1]), float(lng1[2]),
-                    float(lat1[0]), float(lat1[1]), float(lat1[2]))
-    _write_vrt(folder / f"{stem}.vrt", img_path, geotransform=geotransform)
-    _write_vrt(folder / f"{stem}.gcps.vrt", img_path, gcps=gcps)
-    wld_ext = _WLD_EXT.get(img_path.suffix.lower(), ".wld")
-    _write_world_file(folder / f"{stem}{wld_ext}", lng1, lat1, d1)
-    (folder / f"{stem}.prj").write_text(_WGS84_PRJ)
-    logging.info(f"  Saved: {stem}.vrt (open THIS in QGIS -- displays georeferenced)")
-    logging.info(f"  Saved: {stem}.gcps.vrt (for precise TPS warp: "
-                 f"gdalwarp -tps -t_srs EPSG:4326 {stem}.gcps.vrt {stem}_warped.tif)")
-    logging.info(f"  Saved: {stem}{wld_ext} + {stem}.prj (world-file fallback)")
+    # GDAL geotransform from the affine fit (BNG metres):
+    # E = c0 + c1*px + c2*py, with pixel (0,0) at the top-left image corner.
+    geotransform = (float(e1[0]), float(e1[1]), float(e1[2]),
+                    float(n1[0]), float(n1[1]), float(n1[2]))
+    vrt_path = folder / f"{stem}.vrt"
+    _write_vrt(vrt_path, img_path, geotransform=geotransform)
+    logging.info(f"  Saved: {vrt_path.name} (open THIS in QGIS -- displays georeferenced)")
+
+    # Pyramids make multi-hundred-megapixel scans usable in QGIS. Built once;
+    # an existing .ovr is kept (overviews hold pixels only, not the georef).
+    if not Path(str(vrt_path) + ".ovr").exists():
+        build_overviews(vrt_path, external=True)
 
     if warp:
-        warped = folder / f"{stem}_warped.tif"
+        warped = folder / f"{stem}_bng.tif"
         if warped.exists():
             logging.info(f"  {warped.name} already exists -- skipping warp.")
         else:
-            warp_geotiff(folder / f"{stem}.gcps.vrt", warped)
+            gcps_vrt = folder / f"{stem}.gcps.vrt"      # temporary warp input
+            try:
+                _write_vrt(gcps_vrt, img_path, gcps=gcps)
+                warp_geotiff(gcps_vrt, warped)
+            finally:
+                gcps_vrt.unlink(missing_ok=True)
 
     conn.execute(
-        "UPDATE maps SET status='georeferenced', georef_rms_m=? WHERE map_pid=?",
-        (round(rms2, 1), row["map_pid"]),
+        "UPDATE maps SET status='georeferenced', georef_rms_m=?, "
+        "image_path=COALESCE(image_path, ?) WHERE map_pid=?",
+        (round(rms2, 1), str(img_path), row["map_pid"]),
     )
     conn.commit()
     return True, fetched
@@ -994,7 +1065,7 @@ def _resolve_targets(conn, specs):
     Names are matched case-insensitively, exact first, then substring."""
     pids = []
     for s in specs:
-        s = s.split("#", 1)[0].strip()
+        s = s.split("#", 1)[0].strip()   # drop inline or whole-line comments
         if not s:
             continue
         if s.isdigit():
@@ -1136,6 +1207,213 @@ def cmd_list(args):
     conn.close()
 
 
+# Everything a map folder legitimately holds (suffixes after the stem).
+_STANDARD_SUFFIXES = (".jpg", ".jpeg", ".tif", ".tiff", ".png",
+                      ".parcels.geojson", ".vrt", ".vrt.ovr", "_bng.tif")
+# Sidecars written by older versions, all regenerable from the cached GeoJSON.
+_LEGACY_SUFFIXES = (".gcps.vrt", ".bng.gcps.vrt", ".gcps.csv", ".jgw", ".jpw",
+                    ".tfw", ".pgw", ".wld", ".prj")
+
+
+def cmd_tidy(args):
+    """Report (dry run) or delete legacy sidecar files in the map folders."""
+    victims, odd, partial = [], [], []
+    for folder in sorted(p for p in DOWNLOADS_DIR.glob("*/*") if p.is_dir()):
+        if (folder / ".tiles").is_dir():
+            partial.append(folder)
+        for f in sorted(folder.iterdir()):
+            if not f.is_file():
+                continue
+            if f.name.endswith(_LEGACY_SUFFIXES):
+                victims.append(f)
+            elif f.name.endswith("_warped.tif"):
+                if args.include_warped:
+                    victims.append(f)
+                else:
+                    odd.append((f, "old WGS84 warp -- use --include-warped to remove"))
+            elif not f.name.endswith(_STANDARD_SUFFIXES):
+                odd.append((f, "not part of the standard set"))
+    total = sum(f.stat().st_size for f in victims)
+    for f in victims:
+        print(f"  {'delete' if args.apply else 'would delete'}  "
+              f"{f.relative_to(DOWNLOADS_DIR)}  ({f.stat().st_size/1e6:.1f} MB)")
+        if args.apply:
+            f.unlink()
+    for f, why in odd:
+        print(f"  kept  {f.relative_to(DOWNLOADS_DIR)}  ({why})")
+    for d in partial:
+        print(f"  kept  {d.relative_to(DOWNLOADS_DIR)}/.tiles  (unfinished download; "
+              "re-run 'download' to resume)")
+    verb = "Deleted" if args.apply else "Would delete"
+    print(f"\n{verb} {len(victims)} file(s), {total/1e6:.1f} MB."
+          + ("" if args.apply else "  Re-run with --apply to delete."))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MERGE -- bring maps downloaded on another machine into this database
+# ──────────────────────────────────────────────────────────────────────────────
+# Only the scan and the parcels GeoJSON are copied (plus the DB row, with paths
+# rewritten for this machine). Everything derived -- .vrt, pyramids, GeoPackage
+# -- is regenerated here, so the other machine's old sidecars never come across.
+# The source is only ever read. Safe to repeat: maps already present are skipped.
+
+_IMAGE_EXTS = (".jpg", ".jpeg", ".tiff", ".tif", ".png")
+_META_COLS = ("title", "date", "scale", "canvas_id", "width", "height", "handle_url")
+
+
+def _find_source_image(src_downloads, row):
+    folder, stem = map_paths(row, src_downloads)
+    for ext in _IMAGE_EXTS:
+        if (folder / f"{stem}{ext}").exists():
+            return folder / f"{stem}{ext}"
+    pid = row["map_pid"]       # folder layout differs on older versions: search by PID
+    for ext in _IMAGE_EXTS:
+        hits = sorted(src_downloads.glob(f"*/*_{pid}/*_{pid}{ext}"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _image_size_ok(img, row):
+    """True if the image matches the dimensions the source DB expects."""
+    scale = (row["scale_factor"] if "scale_factor" in row.keys() else 1) or 1
+    if not (row["width"] and row["height"]):
+        return True, None
+    want = (math.ceil(row["width"] / scale), math.ceil(row["height"] / scale))
+    try:
+        with Image.open(img) as im:
+            got = im.size
+    except Exception as exc:
+        return False, f"unreadable ({exc})"
+    return (abs(got[0] - want[0]) <= 1 and abs(got[1] - want[1]) <= 1), \
+        f"{got[0]}x{got[1]}px, expected {want[0]}x{want[1]}"
+
+
+def cmd_merge(args):
+    src_root = Path(args.source).expanduser()
+    src_db = src_root / "tithe_maps.db"
+    if not src_db.exists():
+        logging.error(f"No tithe_maps.db in {src_root} -- point --from at the "
+                      "other machine's 'tithe_maps' folder (the one holding the .db).")
+        return
+    src_downloads = src_root / "downloads"
+    apply = args.apply
+
+    sconn = sqlite3.connect(f"file:{src_db.as_posix()}?mode=ro", uri=True)
+    sconn.row_factory = sqlite3.Row
+    conn = get_conn()
+    local = {r["map_pid"]: r for r in conn.execute("SELECT * FROM maps")}
+    tag = "" if apply else "[dry run] "
+
+    imported, kept, meta_filled, new_rows, problems = [], 0, 0, 0, 0
+    for srow in sconn.execute("SELECT * FROM maps ORDER BY county, parish"):
+        pid = srow["map_pid"]
+        lrow = local.get(pid)
+        label = f"{srow['county']} / {srow['parish']} (pid={pid})"
+
+        # 1. catalogue row unknown here -> add it
+        if lrow is None:
+            new_rows += 1
+            if apply:
+                cols = [c for c in srow.keys() if c not in ("image_path", "parcels_path")]
+                conn.execute(
+                    f"INSERT INTO maps ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                    [srow[c] for c in cols])
+                conn.commit()
+                lrow = conn.execute("SELECT * FROM maps WHERE map_pid=?", (pid,)).fetchone()
+                local[pid] = lrow
+                if lrow["status"] in ("downloaded", "georeferenced"):
+                    conn.execute("UPDATE maps SET status='ready' WHERE map_pid=?", (pid,))
+                    conn.commit()
+                    lrow = conn.execute("SELECT * FROM maps WHERE map_pid=?", (pid,)).fetchone()
+                    local[pid] = lrow
+            logging.info(f"  {tag}new catalogue entry: {label}")
+
+        # 2. fill gaps in metadata / quality flag (never overwrite what we have)
+        if lrow is not None and apply:
+            gaps = {c: srow[c] for c in _META_COLS
+                    if lrow[c] in (None, "") and srow[c] not in (None, "")}
+            if lrow["quality"] is None and srow["quality"] is not None:
+                gaps["quality"] = srow["quality"]
+            if gaps:
+                conn.execute(f"UPDATE maps SET {', '.join(f'{c}=?' for c in gaps)} "
+                             "WHERE map_pid=?", [*gaps.values(), pid])
+                if lrow["status"] == "discovered" and "canvas_id" in gaps:
+                    conn.execute("UPDATE maps SET status='ready' WHERE map_pid=? "
+                                 "AND status='discovered'", (pid,))
+                conn.commit()
+                meta_filled += 1
+
+        # 3. scan + parcels
+        if srow["status"] not in ("downloaded", "georeferenced"):
+            continue
+        if lrow is not None and _has_image_on_disk(lrow):
+            kept += 1
+            continue
+        img = _find_source_image(src_downloads, srow)
+        if not img:
+            logging.warning(f"  skip {label}: source says downloaded but no image found")
+            problems += 1
+            continue
+        ok, detail = _image_size_ok(img, srow)
+        if not ok:
+            logging.warning(f"  skip {label}: image looks incomplete ({detail})")
+            problems += 1
+            continue
+
+        folder, stem = map_paths(lrow if lrow is not None else srow)
+        dest_img = folder / f"{stem}{img.suffix.lower()}"
+        dest_gj = folder / f"{stem}.parcels.geojson"
+        src_gj = img.parent / f"{img.stem}.parcels.geojson"
+        scale = (srow["scale_factor"] if "scale_factor" in srow.keys() else 1) or 1
+        mb = img.stat().st_size / 1e6
+        logging.info(f"  {tag}import {label}: {img.name} ({mb:.0f} MB, scale x{scale})")
+        imported.append(pid)
+        if not apply:
+            continue
+
+        folder.mkdir(parents=True, exist_ok=True)
+        transfer = shutil.move if args.move else shutil.copy2
+        transfer(str(img), str(dest_img))
+
+        # Pixel coordinates in the GeoJSON are tied to the image's scale, so the
+        # GeoJSON must come from the same download as the scan.
+        local_scale = None
+        if dest_gj.exists():
+            try:
+                local_scale = (json.loads(dest_gj.read_text(encoding="utf-8"))
+                               .get("metadata", {}).get("scale_factor", 1))
+            except (OSError, ValueError):
+                pass
+        if src_gj.exists() and (not dest_gj.exists() or local_scale != scale):
+            shutil.copy2(str(src_gj), str(dest_gj))
+        conn.execute(
+            "UPDATE maps SET image_path=?, parcels_path=COALESCE(?, parcels_path), "
+            "status='downloaded', scale_factor=?, downloaded_date=COALESCE(?, downloaded_date) "
+            "WHERE map_pid=?",
+            (str(dest_img), str(dest_gj) if dest_gj.exists() else None, scale,
+             srow["downloaded_date"], pid))
+        conn.commit()
+
+    sconn.close()
+    logging.info(f"\n{tag}Merge summary: {len(imported)} map(s) to import, "
+                 f"{kept} already here (kept), {new_rows} new catalogue row(s), "
+                 f"{meta_filled} row(s) had metadata/quality filled, {problems} problem(s).")
+
+    if not apply:
+        logging.info("Nothing changed. Re-run with --apply to merge.")
+        conn.close()
+        return
+
+    # Derive the BNG .vrt + pyramids for what we just brought in.
+    for i, pid in enumerate(imported, 1):
+        row = conn.execute("SELECT * FROM maps WHERE map_pid=?", (pid,)).fetchone()
+        logging.info(f"\n[{i}/{len(imported)}] Georeferencing {row['county']} / {row['parish']}")
+        process_parcels_and_georef(conn, row)
+    conn.close()
+    logging.info("\nMerge complete.")
+
+
 def _quality_filter(args):
     if getattr(args, "include_low", False):
         return "(quality IS NULL OR quality IN ('high','low'))"
@@ -1244,21 +1522,31 @@ def cmd_download(args):
 # PARCELS / GEOREFERENCE as standalone commands
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _has_image_on_disk(row):
+    """True if the map's scan exists at its registered or conventional path --
+    catches scans downloaded before the DB registered them (status 'ready')."""
+    if row["image_path"] and Path(row["image_path"]).exists():
+        return True
+    folder, stem = map_paths(row)
+    return (folder / f"{stem}.jpg").exists()
+
+
 def _select_rows(conn, args, need_image=False):
     conditions, params = [], []
     if args.pid:
         conditions.append("map_pid=?")
         params.append(args.pid)
     else:
-        if need_image:
-            conditions.append("status IN ('downloaded','georeferenced')")
         if args.county:
             conditions.append("county=?")
             params.append(args.county)
     where = " AND ".join(conditions) if conditions else "1=1"
-    return conn.execute(
+    rows = conn.execute(
         f"SELECT * FROM maps WHERE {where} ORDER BY county, parish", params
     ).fetchall()
+    if need_image and not args.pid:
+        rows = [r for r in rows if _has_image_on_disk(r)]
+    return rows
 
 
 def cmd_parcels(args):
@@ -1309,7 +1597,7 @@ _GPKG_COLUMNS = [
     ("pounds", "REAL"), ("shillings", "REAL"), ("pence", "REAL"),
     ("rent_decimal_pounds", "REAL"),
     ("app_order", "INTEGER"), ("pixel_x", "INTEGER"), ("pixel_y", "INTEGER"),
-    ("nlw_id", "TEXT"),
+    ("nlw_id", "TEXT"), ("easting", "REAL"), ("northing", "REAL"),
 ]
 
 
@@ -1342,7 +1630,7 @@ def _rent_decimal_pounds(pounds, shillings, pence):
     return round((l or 0.0) + (s or 0.0) / 20.0 + (d or 0.0) / 240.0, 4)
 
 
-def _gpkg_point_blob(x, y, srs_id=4326):
+def _gpkg_point_blob(x, y, srs_id=BNG_EPSG):
     """GeoPackage geometry BLOB: GP header (no envelope) + little-endian WKB point."""
     import struct
     header = struct.pack("<2sBBi", b"GP", 0, 0x01, srs_id)
@@ -1381,32 +1669,37 @@ def _gpkg_open(path: Path):
         "INSERT INTO gpkg_spatial_ref_sys VALUES (?,?,?,?,?,?)",
         [("Undefined cartesian SRS", -1, "NONE", -1, "undefined", None),
          ("Undefined geographic SRS", 0, "NONE", 0, "undefined", None),
-         ("WGS 84", 4326, "EPSG", 4326, _GPKG_WGS84_WKT, None)])
+         ("WGS 84", 4326, "EPSG", 4326, _GPKG_WGS84_WKT, None),
+         ("OSGB 1936 / British National Grid", BNG_EPSG, "EPSG", BNG_EPSG,
+          _BNG_WKT, None)])
     return db
 
 
 def _gpkg_add_layer(db, layer: str, features_with_meta):
-    """Add one point layer. features_with_meta: iterable of (feature, row)."""
+    """Add one point layer in EPSG:27700. features_with_meta: iterable of
+    (feature, row); feature geometry is WGS84 lon/lat, reprojected here."""
     cols_sql = ", ".join(f'"{n}" {t}' for n, t in _GPKG_COLUMNS)
     db.execute(f'CREATE TABLE "{layer}" '
                f'(fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB, {cols_sql})')
 
-    bbox = [180.0, 90.0, -180.0, -90.0]
-    records = []
+    items = []
     for feat, row in features_with_meta:
-        geom = feat.get("geometry") or {}
-        coords = geom.get("coordinates")
-        if not coords:
-            continue
-        lng, lat = float(coords[0]), float(coords[1])
-        bbox = [min(bbox[0], lng), min(bbox[1], lat),
-                max(bbox[2], lng), max(bbox[3], lat)]
+        coords = (feat.get("geometry") or {}).get("coordinates")
+        if coords:
+            items.append((feat, row, (float(coords[0]), float(coords[1]))))
+    en = lonlat_to_bng([it[2] for it in items]) if items else []
+
+    bbox = [1e12, 1e12, -1e12, -1e12]
+    records = []
+    for (feat, row, _), (east, north) in zip(items, en):
+        bbox = [min(bbox[0], east), min(bbox[1], north),
+                max(bbox[2], east), max(bbox[3], north)]
         p = feat.get("properties", {})
         land_use = p.get("land_use_facet")
         if isinstance(land_use, list):
             land_use = "; ".join(str(v) for v in land_use)
         records.append((
-            _gpkg_point_blob(lng, lat),
+            _gpkg_point_blob(east, north),
             row["map_pid"], row["county"], row["parish"],
             str(p.get("field_number")) if p.get("field_number") is not None else None,
             p.get("farm_name"), p.get("field_name"), land_use,
@@ -1416,7 +1709,7 @@ def _gpkg_add_layer(db, layer: str, features_with_meta):
             p.get("pounds"), p.get("shillings"), p.get("pence"),
             _rent_decimal_pounds(p.get("pounds"), p.get("shillings"), p.get("pence")),
             p.get("app_order"), p.get("pixel_x"), p.get("pixel_y"),
-            p.get("id"),
+            p.get("id"), round(east, 2), round(north, 2),
         ))
     if not records:
         db.execute(f'DROP TABLE "{layer}"')
@@ -1427,10 +1720,10 @@ def _gpkg_add_layer(db, layer: str, features_with_meta):
                    + ", ".join(f'"{n}"' for n, _ in _GPKG_COLUMNS)
                    + f") VALUES ({ph})", records)
     db.execute("INSERT INTO gpkg_contents (table_name, data_type, identifier, "
-               "min_x, min_y, max_x, max_y, srs_id) VALUES (?,?,?,?,?,?,?,4326)",
-               (layer, "features", layer, *bbox))
-    db.execute("INSERT INTO gpkg_geometry_columns VALUES (?,?,?,4326,0,0)",
-               (layer, "geom", "POINT"))
+               "min_x, min_y, max_x, max_y, srs_id) VALUES (?,?,?,?,?,?,?,?)",
+               (layer, "features", layer, *bbox, BNG_EPSG))
+    db.execute("INSERT INTO gpkg_geometry_columns VALUES (?,?,?,?,0,0)",
+               (layer, "geom", "POINT", BNG_EPSG))
     return len(records)
 
 
@@ -1453,7 +1746,7 @@ def _gpkg_add_layer(db, layer: str, features_with_meta):
 # therefore lands exactly where that pixel landed in the output raster, and the
 # residual error cancels out entirely.
 
-TOOLKIT_EPSG = 27700
+TOOLKIT_EPSG = BNG_EPSG
 TOOLKIT_RES = 0.5    # metres per pixel
 
 # Map our column names onto the toolkit's existing (Holnicote) schema so the
@@ -1498,10 +1791,6 @@ def _gdal_batch_transform(tool: Path, args: list, coords, chunk=20000):
 def _write_points_gpkg(path: Path, layer: str, records, columns):
     """Write a single-layer point GeoPackage in EPSG:27700 (pure sqlite3)."""
     db = _gpkg_open(path)
-    db.execute(
-        "INSERT INTO gpkg_spatial_ref_sys VALUES (?,?,?,?,?,?)",
-        ("OSGB 1936 / British National Grid", TOOLKIT_EPSG, "EPSG", TOOLKIT_EPSG,
-         _BNG_WKT, None))
 
     col_sql = ", ".join(f'"{n}" {t}' for n, t in columns)
     db.execute(f'CREATE TABLE "{layer}" '
@@ -1525,19 +1814,6 @@ def _write_points_gpkg(path: Path, layer: str, records, columns):
                (layer, "geom", "POINT", TOOLKIT_EPSG))
     db.commit()
     db.close()
-
-
-_BNG_WKT = (
-    'PROJCS["OSGB 1936 / British National Grid",'
-    'GEOGCS["OSGB 1936",DATUM["OSGB_1936",'
-    'SPHEROID["Airy 1830",6377563.396,299.3249646,AUTHORITY["EPSG","7001"]],'
-    'AUTHORITY["EPSG","6277"]],PRIMEM["Greenwich",0],'
-    'UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4277"]],'
-    'PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",49],'
-    'PARAMETER["central_meridian",-2],PARAMETER["scale_factor",0.9996012717],'
-    'PARAMETER["false_easting",400000],PARAMETER["false_northing",-100000],'
-    'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AUTHORITY["EPSG","27700"]]'
-)
 
 
 def cmd_export_toolkit(args):
@@ -1587,17 +1863,11 @@ def cmd_export_toolkit(args):
         scale = (fc.get("metadata", {}) or {}).get("scale_factor", 1) or 1
 
         # ── GCPs: pixel -> BNG (reproject the lon/lat GCPs once) ─────────────
-        gcps = gcps_from_features(features, scale=scale)
-        if len(gcps) < MIN_GCPS:
-            logging.warning(f"  Only {len(gcps)} GCPs -- skipping.")
+        gcps_bng = gcps_bng_from_features(features, scale=scale)
+        if len(gcps_bng) < MIN_GCPS:
+            logging.warning(f"  Only {len(gcps_bng)} GCPs -- skipping.")
             continue
-        gcps = _sigma_clip(gcps)
-
-        lonlat = [(g[2], g[3]) for g in gcps]
-        en = _gdal_batch_transform(
-            gdaltransform, ["-s_srs", "EPSG:4326", "-t_srs", f"EPSG:{TOOLKIT_EPSG}"],
-            lonlat)
-        gcps_bng = [(g[0], g[1], e, n) for g, (e, n) in zip(gcps, en)]
+        gcps_bng = _sigma_clip(gcps_bng)
 
         # GCP VRT in BNG -- used for BOTH the warp and the point placement, so
         # the two are guaranteed to agree.
@@ -1959,7 +2229,7 @@ def main():
                    help="Also produce a north-up warped GeoTIFF (needs QGIS/GDAL)")
 
     p = sub.add_parser("geopackage",
-                       help="Bundle all downloaded parcel points into a GeoPackage for QGIS")
+                       help="Bundle all downloaded parcel points into a BNG (EPSG:27700) GeoPackage for QGIS")
     p.add_argument("--county", help="Only include one county")
     p.add_argument("--split", action="store_true",
                    help="One .gpkg per county instead of one file with per-county layers")
@@ -1977,6 +2247,23 @@ def main():
     p.add_argument("--overwrite", action="store_true",
                    help="Re-warp even if the GeoTIFF already exists")
 
+    p = sub.add_parser(
+        "tidy", help="Remove legacy sidecar files so every map folder is uniform "
+                     "(dry run unless --apply)")
+    p.add_argument("--apply", action="store_true", help="Actually delete the files")
+    p.add_argument("--include-warped", action="store_true",
+                   help="Also remove old WGS84 *_warped.tif rasters")
+
+    p = sub.add_parser(
+        "merge", help="Merge maps downloaded on another machine into this database "
+                      "(dry run unless --apply)")
+    p.add_argument("--from", dest="source", required=True,
+                   help="The other machine's 'tithe_maps' folder (the one containing "
+                        "tithe_maps.db and downloads/)")
+    p.add_argument("--apply", action="store_true", help="Actually copy/merge")
+    p.add_argument("--move", action="store_true",
+                   help="Move scans out of the source instead of copying (saves disk)")
+
     p = sub.add_parser("quality", help="List maps or set a quality flag")
     p.add_argument("--pid", type=int)
     p.add_argument("--set", choices=["high", "low", "excluded", "none"])
@@ -1988,7 +2275,7 @@ def main():
     {
         "discover": cmd_discover, "metadata": cmd_metadata,
         "download": cmd_download, "list": cmd_list, "parcels": cmd_parcels,
-        "coverage": cmd_coverage,
+        "coverage": cmd_coverage, "tidy": cmd_tidy, "merge": cmd_merge,
         "georeference": cmd_georeference, "geopackage": cmd_geopackage,
         "export-toolkit": cmd_export_toolkit, "quality": cmd_quality,
         "status": cmd_status, "export": cmd_export,
