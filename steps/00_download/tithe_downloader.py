@@ -105,6 +105,8 @@ API_DELAY     = 1.5   # seconds between API requests
 TILE_DELAY    = 0.25  # seconds between tile downloads
 MAX_RETRIES   = 4
 
+_IMAGE_EXTS   = (".jpg", ".jpeg", ".tiff", ".tif", ".png")
+
 MIN_GCPS      = 6     # minimum parcels needed for a polynomial fit
 
 BNG_EPSG      = 27700   # British National Grid -- CRS of every georef output
@@ -236,7 +238,42 @@ def init_db():
         # for how much land the map covers. Populated by `coverage` / on fetch.
         conn.execute("ALTER TABLE maps ADD COLUMN coverage_hectares REAL")
     conn.commit()
+    relink_paths(conn)
     conn.close()
+
+def _exists(p):
+    try:
+        return Path(p).exists()
+    except (OSError, ValueError):
+        return False
+
+def relink_paths(conn):
+    """Repair image_path / parcels_path after the tithe_maps folder was moved
+    or copied to another machine/folder (they are stored as absolute paths).
+    Only touches rows whose stored path no longer exists but whose file is
+    present at the standard location under this DOWNLOADS_DIR."""
+    fixed = 0
+    for row in conn.execute("SELECT * FROM maps WHERE image_path IS NOT NULL "
+                            "OR parcels_path IS NOT NULL").fetchall():
+        folder, stem = map_paths(row)
+        updates = {}
+        if row["image_path"] and not _exists(row["image_path"]):
+            ext = Path(row["image_path"].replace("\\", "/")).suffix.lower()
+            for cand in [ext] + [e for e in _IMAGE_EXTS if e != ext]:
+                if (folder / f"{stem}{cand}").exists():
+                    updates["image_path"] = str(folder / f"{stem}{cand}")
+                    break
+        if row["parcels_path"] and not _exists(row["parcels_path"]):
+            gj = folder / f"{stem}.parcels.geojson"
+            if gj.exists():
+                updates["parcels_path"] = str(gj)
+        if updates:
+            conn.execute(f"UPDATE maps SET {', '.join(f'{c}=?' for c in updates)} "
+                         "WHERE map_pid=?", [*updates.values(), row["map_pid"]])
+            fixed += 1
+    if fixed:
+        conn.commit()
+        logging.info(f"Re-pointed stored file paths for {fixed} map(s) to {DOWNLOADS_DIR}.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1258,7 +1295,6 @@ def cmd_tidy(args):
 # -- is regenerated here, so the other machine's old sidecars never come across.
 # The source is only ever read. Safe to repeat: maps already present are skipped.
 
-_IMAGE_EXTS = (".jpg", ".jpeg", ".tiff", ".tif", ".png")
 _META_COLS = ("title", "date", "scale", "canvas_id", "width", "height", "handle_url")
 
 
