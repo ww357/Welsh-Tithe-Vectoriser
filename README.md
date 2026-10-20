@@ -53,97 +53,104 @@ repo root/
 └── config.yaml                         ← pipeline parameters
 ```
 
-Running through the pipeline:
+**Downloading Welsh Tithe maps**:
 
-00_download:
 ```python
+# first cd into 'steps\00_download'
+
 conda activate maptools
 
-# one-off: catalogue every NLW tithe map (~1,074 maps; resumable)
+# one-off: catalogue every NLW tithe map (~1,074 maps)
 python run.py download discover
 
 # download one or more maps (scan + parcel points + georeferencing)
-python run.py download fetch --county Anglesey        # 'fetch' == the downloader's 'download'
-                                                      # or --pids "Llangynllo,4634773"
+python run.py download --pids "4634773, 46347"
 
 # export toolkit-ready sheets INTO data/raw and data/parcel_points
 python run.py download export-toolkit --county Anglesey
 
 python steps/00_download/tithe_downloader.py --help # for clarity
 ```
-Two files in this step:
-- `tithe_downloader.py` — the downloader (copied from `https://github.com/ww357/Vectorise-Welsh-Tithes` (will change this to `Welsh-Tithes-Downloader`)
-  repo). Its catalogue database and downloaded scans live in
-  `steps/00_download/tithe_maps/` (gitignored). 
-- `download.py` — a thin wrapper `run.py` calls. It forwards the downloader's
-  subcommands and, for `export-toolkit`, fills in `--toolkit-dir` with this
-  toolkit's root automatically.
-This will write (per sheet):
-- `data/raw/<sheet>/<sheet>.tif` — north-up **EPSG:27700** GeoTIFF at **0.5 m/px**,
-  exactly what `run.py patchify` expects.
-- `data/parcel_points/<sheet>_points.gpkg` — one seed point per apportionment
-  parcel, EPSG:27700, matched to the raster. The per-sheet name (`<sheet>_points`)
-  is auto-detected by the parcel steps — no per-sheet config change.
 
-The seed-point layer carries `rowid` (1..N, the join key the parcel vectorise step
-uses), `Easting`/`Northing`, the apportionment attributes (`ParishName, ParcelID,
-Landowner, Occupier, FieldName_Desc, AreaName, CultivationState`), the imperial
-area as separate `Acres` / `Rods` / `Perches` columns, and a computed
-**`area_hectares`** total, plus `rent_decimal_pounds`, `pixel_x`/`pixel_y`,
-`map_pid`, `nlw_id`.
+Files in the downloader step:
+
+- `tithe_downloader.py` — the downloader. 
+- `steps/00_download/tithe_maps/` Catalogue database and downloaded scans (gitignored). 
+- `download.py` — for `run.py` calls.
+
+Per map files:
+- `data/raw/<sheet>/<sheet>.tif` — north-up EPSG:27700 GeoTIFF at 0.5 m/px.
+- `data/parcel_points/<sheet>_points.gpkg` — apportionment parcel reprojected to EPSG:27700.
+
+The apportionment point layer carries: 
+- `rowid` (1..N, the join key the parcel vectorise step uses), `Easting`/`Northing`, the apportionment attributes (`ParishName, ParcelID, Landowner, Occupier, FieldName_Desc, AreaName, CultivationState`)
+- the imperial area as separate `Acres` / `Rods` / `Perches` columns
+- a computed **`area_hectares`** total, plus `rent_decimal_pounds`, `pixel_x`/`pixel_y`, `map_pid`, `nlw_id`.
+
+To get any downloaded maps into the vectorisation toolkit run:
 
 ```python
-## Step 01 - Patchify
-conda activate maptools 
-python "steps/01_patchify/draw_mask.py" --sheet MapSheetName
-# run this to interactively make mask of map area on the document if necessary 
-# to reduce patches for inference (or this mask can be made in another programme):
-python "steps/01_patchify/patchify.py" --sheet MapSheetName
-# slice GeoTIFF into 512px patches (use --mask flag if no mask is auto-found)
-
-## Step 02 - Annotate
-python "steps/02_annotate/annotate.py" --sheet MapSheetName
-# open labelme to draw boundary lines and feature polygons
-python "steps/02_annotate/export_masks.py" --sheet MapSheetName
-# convert labelme JSON to binary mask PNGs per feature label
-
-## Step 03 - Fine-tune (Boundaries - U-Net)
-conda activate lines
-python "steps/03_finetune/lines/train.py" --sheet MapSheetName --name map_v1
-# fine-tune boundary U-Net, checkpoints on path-F1
-
-## Step 03 - Fine-tune (Features - MapSAM)
-conda activate polygons
-python "steps/03_finetune/polygons/train.py" --sheet MapSheetName --feature FeatureName --name map_v1
-# fine-tune SAM DoRA weights for one feature class (repeat per feature)
-
-## Step 04 - Predict
-conda activate lines
-python "steps/04_predict/lines/predict.py" --sheet MapSheetName
-# run U-Net on all patches, skips manually annotated ones
-conda activate polygons
-python "steps/04_predict/polygons/predict.py" --sheet MapSheetName --feature FeatureName1 FeatureName2 FeatureName3 ...
-# run MapSAM on all patches for listed features & run text prediction if "text" is specified
-
-## Step 05 - Vectorise
-conda activate maptools
-python "steps/05_vectorise/lines/vectorise.py" --sheet MapSheetName # stitch and vectorise boundary lines
-python "steps/05_vectorise/polygons/vectorise.py" --sheet MapSheetName # stitch and vectorise polygons
-python "steps/05_vectorise/text/text_to_vector.py" --sheet MapSheetName # stitch and vectorise text
-
-## Parcels - point-seeded watershed (run after the boundary lines are vectorised)
-conda activate polygons
-python "steps/04_predict/parcels/parcel_segment.py" --sheet MapSheetName
-# partition the stitched boundary raster into parcels, seeded by apportionment points
-python "steps/05_vectorise/parcels/parcel_vectorise.py" --sheet MapSheetName
-# join apportionment attributes and write the 'parcels' layer to the GeoPackage
-
-## Step 06 - Feedback loop
-conda activate lines
-python "steps/06_feedback/lines/feedback.py" --sheet MapSheetName
-
-# Output: data/outputs/MapSheetName.gpkg
+python run.py download export-toolkit
 ```
+<br>
+
+**Vectorisation options**:
+
+```python
+Usage:  python run.py <command> [--sheet SHEET] [flags...]
+
+  00 download
+    download             maptools  steps/00_download/download.py
+
+  01 patchify
+    reproject            maptools  steps/01_patchify/reproject.py
+    draw-mask            maptools  steps/01_patchify/draw_mask.py
+    patchify             maptools  steps/01_patchify/patchify.py
+
+  02 annotate
+    annotate             maptools  steps/02_annotate/annotate.py
+    export-masks         maptools  steps/02_annotate/export_masks.py
+
+  03 finetune
+    train-lines          lines     steps/03_finetune/lines/train.py
+    train-dashed         lines     steps/03_finetune/dashed/train.py
+    dashed-masks         lines     steps/03_finetune/dashed/gaussian_masks.py
+    train-polygons       polygons  steps/03_finetune/polygons/train.py
+    evaluate-lines       lines     steps/03_finetune/lines/evaluate.py
+
+  04 predict
+    predict-lines        lines     steps/04_predict/lines/predict.py
+    predict-dashed       lines     steps/04_predict/dashed/predict.py
+    predict-polygons     polygons  steps/04_predict/polygons/predict.py
+    predict-text         polygons  steps/04_predict/text/predict.py
+    predict-parcels      polygons  steps/04_predict/parcels/predict.py
+
+  05 vectorise
+    vectorise-lines      maptools  steps/05_vectorise/lines/vectorise.py
+    vectorise-dashed     maptools  steps/05_vectorise/dashed/vectorise.py
+    vectorise-polygons   maptools  steps/05_vectorise/polygons/vectorise.py
+    vectorise-text       maptools  steps/05_vectorise/text/vectorise.py
+        polygons  steps/05_vectorise/parcels/vectorise.py
+
+  06 feedback
+    prepare-lines        maptools  steps/06_feedback/lines/prepare.py
+    feedback-lines       lines     steps/06_feedback/lines/train.py
+    prepare-polygons     polygons  steps/06_feedback/polygons/prepare.py
+    feedback-polygons    polygons  steps/06_feedback/polygons/train.py
+
+  utility
+    fetch-weights        any       steps/fetch_weights.py
+    status               any       steps/status.py
+```
+
+Random notes:
+
+- draw mask : run this to interactively make mask of map area on the document if necessary
+- patchify : slice GeoTIFF into 512px patches (use --mask flag if no mask is auto-found)
+- annotate : open labelme to draw boundary lines and feature polygons
+- export_mask : convert labelme JSON to binary mask PNGs per feature label
+
+
 
 ## Acknowledgements
 
