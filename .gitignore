@@ -14,3 +14,9 @@ models/MapTextPipeline
 models/__pycache__/
 
 steps/00_download/tithe_maps/
+
+temp:
+docs/
+gui/
+identity_check.py
+models/DoRALinearUNet/
