@@ -40,6 +40,7 @@ COMMANDS: dict[str, tuple[str, str | None]] = {
     "pick-patches":       ("steps/02_annotate/pick_patches.py",           "maptools"),
     "autolines":          ("steps/02_annotate/autolines.py",              "maptools"),
     "annotate":           ("steps/02_annotate/annotate.py",               "maptools"),
+    "export-manual":      ("steps/02_annotate/export_manual.py",          "maptools"),
     "export-masks":       ("steps/02_annotate/export_masks.py",           "maptools"),
     # 03 finetune
     "train-lines":        ("steps/03_finetune/lines/train.py",            "lines"),
@@ -59,6 +60,7 @@ COMMANDS: dict[str, tuple[str, str | None]] = {
     "vectorise-polygons": ("steps/05_vectorise/polygons/vectorise.py",    "maptools"),
     "vectorise-text":     ("steps/05_vectorise/text/vectorise.py",        "maptools"),
     "vectorise-parcels":  ("steps/05_vectorise/parcels/vectorise.py",     "polygons"),
+    "import-manual":      ("steps/05_vectorise/manual/import_layers.py",  "maptools"),
     # 06 feedback
     "prepare-lines":      ("steps/06_feedback/lines/prepare.py",          "maptools"),
     "feedback-lines":     ("steps/06_feedback/lines/train.py",            "lines"),
@@ -73,13 +75,13 @@ COMMANDS: dict[str, tuple[str, str | None]] = {
 GROUPS = [
     ("00 download",  ["download"]),
     ("01 patchify",  ["reproject", "draw-mask", "patchify"]),
-    ("02 annotate",  ["pick-patches", "autolines", "annotate", "export-masks"]),
+    ("02 annotate",  ["pick-patches", "autolines", "annotate", "export-manual", "export-masks"]),
     ("03 finetune",  ["train-lines", "train-dashed", "dashed-masks",
                       "train-polygons", "evaluate-lines"]),
     ("04 predict",   ["predict-lines", "predict-dashed", "predict-polygons",
                       "predict-text", "predict-parcels"]),
     ("05 vectorise", ["vectorise-lines", "vectorise-dashed", "vectorise-polygons",
-                      "vectorise-text", "vectorise-parcels"]),
+                      "vectorise-text", "vectorise-parcels", "import-manual"]),
     ("06 feedback",  ["prepare-lines", "feedback-lines",
                       "prepare-polygons", "feedback-polygons"]),
     ("utility",      ["fetch-weights", "status"]),
