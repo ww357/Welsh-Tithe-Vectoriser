@@ -6,6 +6,8 @@ data/
 
 prompts.txt
 
+Vectorising Welsh Tithes.qgz
+
 models/base/
 models/finetuned/
 models/logs/
